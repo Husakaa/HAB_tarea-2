@@ -48,7 +48,8 @@ def cargar_red(archivo):
     elif ',' in primera:
         # DIAMOnD: CSV (puede estar en .txt o .csv)
         print("   Formato: DIAMOnD (CSV)")
-        df = pd.read_csv(archivo, header=None, names=['source', 'target'])
+        # CLAVE: dtype=str para forzar que los IDs se lean como strings
+        df = pd.read_csv(archivo, header=None, names=['source', 'target'], dtype=str)
         return nx.from_pandas_edgelist(df, 'source', 'target')
     
     else:
@@ -62,7 +63,8 @@ def cargar_red(archivo):
                 for linea in f:
                     partes = linea.strip().split()
                     if len(partes) == 3:
-                        G.add_edge(partes[0], partes[2], weight=float(partes[1]))
+                        # Asegurar que los nodos son strings
+                        G.add_edge(str(partes[0]), str(partes[2]), weight=float(partes[1]))
             return G
         else:
             raise ValueError(f"Formato no reconocido. Primera línea: {primera}")
@@ -201,141 +203,190 @@ def agregar_genes_a_red(archivo_red, genes_faltantes, archivo_string=None):
 
 
 def convertir_a_entrez(genes):
-    """
-    Convierte símbolos de genes a Entrez IDs usando MyGene.info
-    
-    Args:
-        genes: Lista de símbolos de genes (ej: ['ENO1', 'PGK1', 'HK2'])
-    
-    Returns:
-        dict: Mapeo {símbolo: entrez_id}
-    """
-    print("\nConvirtiendo símbolos a Entrez IDs...")
-    
+    """Convierte símbolos de genes a Entrez IDs usando MyGene"""
     try:
-        import mygene
         mg = mygene.MyGeneInfo()
+        print("Convirtiendo símbolos a Entrez IDs...")
         
-        # Consultar MyGene
         results = mg.querymany(genes, scopes='symbol', fields='entrezgene', species='human')
         
-        # Crear mapeo
         mapeo = {}
-        no_encontrados = []
-        
         for r in results:
             simbolo = r.get('query')
-            entrez = r.get('entrezgene')
+            entrez_id = r.get('entrezgene')
             
-            if entrez:
-                mapeo[simbolo] = str(int(entrez))
-                print(f"   {simbolo} -> {int(entrez)}")
+            if entrez_id:
+                # Asegurar que el Entrez ID es string
+                mapeo[simbolo] = str(entrez_id)
+                print(f"   {simbolo} -> {entrez_id}")
             else:
-                no_encontrados.append(simbolo)
-        
-        if no_encontrados:
-            print(f"\nAdvertencia: No se encontró Entrez ID para: {', '.join(no_encontrados)}")
+                print(f"   {simbolo} -> NO ENCONTRADO")
         
         return mapeo
         
     except ImportError:
-        print("\nError: mygene no instalado.")
-        print("Instala con: pip install mygene")
-        sys.exit(1)
+        print("Error: mygene no instalado. Instalar con: pip install mygene")
+        return {}
     except Exception as e:
-        print(f"\nError al consultar MyGene.info: {e}")
-        print("Verifica tu conexión a internet")
-        sys.exit(1)
+        print(f"Error al convertir genes: {e}")
+        return {}
 
 
-def guild(G, semillas):
+def guild(G, genes_semilla, r=0.5, iteraciones=100, epsilon=1e-6):
     """
-    GUILD usando PageRank personalizado de NetworkX
-    (equivalente a Random Walk with Restart)
+    GUILD: Algoritmo de propagación de redes basado en random walk con restart.
+    
+    Args:
+        G: Grafo de NetworkX
+        genes_semilla: Lista de genes iniciales
+        r: Probabilidad de restart (default 0.5)
+        iteraciones: Número máximo de iteraciones
+        epsilon: Criterio de convergencia
+    
+    Returns:
+        DataFrame con genes rankeados por score
     """
-    print("\nEjecutando GUILD (PageRank)...")
+    print("\nEjecutando GUILD...")
+    print(f"   Genes semilla: {len(genes_semilla)}")
+    print(f"   Parámetros: r={r}, iteraciones={iteraciones}")
     
-    # Personalización: probabilidad 1 en semillas, 0 en el resto
-    personalizacion = {nodo: 1.0 if nodo in semillas else 0.0 for nodo in G.nodes()}
+    # Inicialización
+    nodos = list(G.nodes())
+    n = len(nodos)
+    nodo_idx = {nodo: i for i, nodo in enumerate(nodos)}
     
-    # PageRank personalizado
-    scores = nx.pagerank(G, personalization=personalizacion, alpha=0.85)
+    # Vector inicial (1 para semillas, 0 resto)
+    p0 = np.zeros(n)
+    for gen in genes_semilla:
+        if gen in nodo_idx:
+            p0[nodo_idx[gen]] = 1.0
+    p0 = p0 / np.sum(p0)  # Normalizar
     
-    # Crear DataFrame
-    df = pd.DataFrame([
-        {'gene': nodo, 'guild_score': score, 'is_seed': nodo in semillas}
-        for nodo, score in scores.items()
-    ]).sort_values('guild_score', ascending=False)
+    # Matriz de transición (normalizada por fila)
+    A = nx.to_numpy_array(G, nodelist=nodos, weight='weight')
+    row_sums = A.sum(axis=1)
+    row_sums[row_sums == 0] = 1  # Evitar división por cero
+    A = A / row_sums[:, np.newaxis]
     
-    return df
+    # Iteración
+    p = p0.copy()
+    for i in range(iteraciones):
+        p_nuevo = (1 - r) * A.T @ p + r * p0
+        
+        # Verificar convergencia
+        if np.linalg.norm(p_nuevo - p) < epsilon:
+            print(f"   Convergencia en iteración {i+1}")
+            break
+        p = p_nuevo
+    else:
+        print(f"   Máximo de iteraciones alcanzado ({iteraciones})")
+    
+    # Crear DataFrame con resultados
+    resultados = pd.DataFrame({
+        'gene': nodos,
+        'score': p
+    })
+    resultados = resultados.sort_values('score', ascending=False)
+    resultados['rank'] = range(1, len(resultados) + 1)
+    
+    print("   Top 5 genes:")
+    for _, row in resultados.head().iterrows():
+        print(f"      {row['gene']}: {row['score']:.6f}")
+    
+    return resultados[['rank', 'gene', 'score']]
 
 
-def diamond(G, semillas, max_genes=200):
+def diamond(G, genes_semilla, top_k=200):
     """
-    DIAMOnD: Disease Module Detection
-    Algoritmo iterativo con test hipergeométrico
+    DIAMOnD: Disease Module Detection Algorithm.
+    Identifica módulo de enfermedad mediante conectividad iterativa.
+    
+    Args:
+        G: Grafo de NetworkX
+        genes_semilla: Lista de genes iniciales
+        top_k: Número de genes a añadir al módulo
+    
+    Returns:
+        DataFrame con genes rankeados
     """
     print("\nEjecutando DIAMOnD...")
+    print(f"   Genes semilla: {len(genes_semilla)}")
+    print(f"   Top K: {top_k}")
     
-    modulo = set(semillas)
-    candidatos = set(G.nodes()) - modulo
-    n_total = G.number_of_nodes()
+    # Convertir a conjunto para búsqueda rápida
+    modulo = set(genes_semilla)
+    genes_candidatos = set(G.nodes()) - modulo
+    
+    N = G.number_of_nodes()  # Total de nodos en red
+    k_total = sum(dict(G.degree()).values())  # Suma de todos los grados
+    
     resultados = []
     
-    for i in range(min(max_genes, len(candidatos))):
-        mejor = None
-        mejor_pval = 1.0
-        
-        # Evaluar todos los candidatos
-        for candidato in candidatos:
-            conexiones = sum(1 for vecino in G.neighbors(candidato) if vecino in modulo)
-            grado = G.degree(candidato)
-            
-            if grado > 0:
-                # Test hipergeométrico
-                pval = hypergeom.sf(conexiones - 1, n_total, len(modulo), grado)
-                
-                if pval < mejor_pval:
-                    mejor_pval = pval
-                    mejor = (candidato, conexiones, grado)
-        
-        if not mejor:
+    for iteracion in range(top_k):
+        if not genes_candidatos:
             break
         
-        # Añadir mejor candidato al módulo
-        gen, conex, grado = mejor
-        modulo.add(gen)
-        candidatos.remove(gen)
+        mejor_gen = None
+        mejor_pval = 1.0
+        
+        # Para cada candidato, calcular p-value hipergeométrico
+        for candidato in genes_candidatos:
+            # k: grado del candidato
+            k = G.degree(candidato)
+            
+            # s: número de conexiones con el módulo
+            s = sum(1 for vecino in G.neighbors(candidato) if vecino in modulo)
+            
+            # Hipergeométrico: P(X >= s | N, k_modulo, k)
+            k_modulo = sum(G.degree(gen) for gen in modulo)
+            
+            # Evitar errores en parámetros
+            if k_modulo >= N or k >= N:
+                continue
+            
+            pval = hypergeom.sf(s - 1, N, k_modulo, k)
+            
+            if pval < mejor_pval:
+                mejor_pval = pval
+                mejor_gen = candidato
+        
+        if mejor_gen is None:
+            break
+        
+        # Añadir mejor gen al módulo
+        modulo.add(mejor_gen)
+        genes_candidatos.remove(mejor_gen)
         
         resultados.append({
-            'rank': i + 1,
-            'gene': gen,
-            'p_value': mejor_pval,
-            'diamond_score': -np.log10(mejor_pval + 1e-300),
-            'connections_to_module': conex,
-            'total_degree': grado
+            'rank': iteracion + 1,
+            'gene': mejor_gen,
+            'p_value': mejor_pval
         })
         
-        if (i + 1) % 50 == 0:
-            print(f"   Procesados {i + 1}/{max_genes} genes...")
+        if (iteracion + 1) % 50 == 0:
+            print(f"   Iteración {iteracion + 1}/{top_k}")
     
-    df = pd.DataFrame(resultados)
+    df_resultados = pd.DataFrame(resultados)
     
-    return df
+    print("   Top 5 genes:")
+    for _, row in df_resultados.head().iterrows():
+        print(f"      {row['gene']}: p={row['p_value']:.2e}")
+    
+    return df_resultados
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Propagación en redes - GUILD & DIAMOnD',
+        description='Network Propagation - GUILD & DIAMOnD',
         epilog="""
-Ejemplos:
-  # Uso básico (usa redes por defecto)
+EJEMPLOS:
+  # Usar redes por defecto con Entrez IDs
   python %(prog)s -g 2023 5230 3099
   
-  # Con red personalizada
-  python %(prog)s -n data/string_network_filtered_hugo-400.tsv -s data/genes_seed.txt
+  # Usar red personalizada con símbolos
+  python %(prog)s -n data/string_network_filtered_hugo-400.tsv -g ENO1 PGK1 HK2
   
-  # Solo un algoritmo
+  # Especificar solo GUILD
   python %(prog)s -g 2023 5230 3099 -a guild
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -404,6 +455,9 @@ Ejemplos:
                 print("Error: No se pudieron convertir los genes")
                 sys.exit(1)
         
+        # Asegurar que genes_convertidos son strings
+        genes_convertidos = [str(g) for g in genes_convertidos]
+        
         # Aplicar GUILD
         if args.algorithm in ['guild', 'both']:
             network_guild = 'data/network_guild.txt'
@@ -458,6 +512,9 @@ Ejemplos:
         G = cargar_red(args.network)
         print(f"   {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
         
+        # Convertir genes a strings para comparación consistente
+        genes = [str(g) for g in genes]
+        
         # Verificar genes en la red
         validos = [g for g in genes if g in G.nodes()]
         no_encontrados = [g for g in genes if g not in G.nodes()]
@@ -477,7 +534,7 @@ Ejemplos:
                 
                 for gen in genes:
                     if gen in mapeo:
-                        entrez_id = mapeo[gen]
+                        entrez_id = str(mapeo[gen])  # Asegurar string
                         if entrez_id in G.nodes():
                             genes_finales.append(entrez_id)
                             print(f"   {gen} ({entrez_id}) encontrado en red")
@@ -499,13 +556,12 @@ Ejemplos:
                         # Volver a verificar
                         genes_finales = []
                         for gen in genes:
-                            if gen in mapeo and mapeo[gen] in G.nodes():
-                                genes_finales.append(mapeo[gen])
-                            elif gen in G.nodes():
-                                genes_finales.append(gen)
+                            entrez_id = str(mapeo.get(gen, gen))
+                            if entrez_id in G.nodes():
+                                genes_finales.append(entrez_id)
                 
                 validos = genes_finales
-                no_encontrados = [g for g in genes if g not in mapeo or mapeo.get(g) not in G.nodes()]
+                no_encontrados = [g for g in genes if g not in mapeo or str(mapeo.get(g)) not in G.nodes()]
         
         if no_encontrados and len(validos) == 0:
             print(f"\nGenes no encontrados en red (después de conversión): {', '.join(no_encontrados)}")
