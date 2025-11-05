@@ -17,3 +17,6 @@ numpy>=1.24.0
 
 # Análisis estadístico (test hipergeométrico para DIAMOnD)
 scipy>=1.10.0
+
+# Conversión de genes
+mygene>=3.2.0
